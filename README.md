@@ -6,8 +6,6 @@ First-pass EU AI Act and GDPR risk assessment of AI systems described in natural
 ![python](https://img.shields.io/badge/python-3.12-blue)
 ![model](https://img.shields.io/badge/model-qwen2.5%3A7b%20(Ollama)-orange)
 
-> [!WARNING]
-> Research prototype, not legal advice. The knowledge base contains simplified summaries of the regulations ([`knowledge/SOURCES.md`](knowledge/SOURCES.md)). The evaluation set is synthetic and has not been reviewed by legal experts.
 
 ## Overview
 
