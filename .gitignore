@@ -13,3 +13,7 @@ reports/
 .DS_Store
 .vscode/
 .idea/
+
+# Local notes and recordings (not part of the published repo)
+LEARNING.md
+docs/
