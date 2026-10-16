@@ -1,22 +1,11 @@
-"""v2 — the LangGraph agent, with its tools served by an MCP server.
+"""v2 — the v1 graph with tools discovered and executed over MCP (stdio).
 
-v1: the tools are Python functions IMPORTED into the agent (same process).
-v2: the agent starts v2_mcp/server.py as a subprocess, ASKS it which tools
-    exist (with their JSON schemas), and calls them over the MCP protocol.
-    The agent does not need to know how the tools are implemented.
+The agent spawns v2_mcp/server.py, lists its tools and calls them through the
+protocol; it has no knowledge of their implementation. Human interaction
+(ask_user, report approval) stays client-side.
 
-Why it matters in a company:
-  - one tool server, many clients: this agent, Claude Desktop, an IDE, another team's agent;
-  - separation of concerns: the compliance team owns the server (rules, knowledge,
-    guardrails); agent builders only consume it;
-  - governance: one place to update the knowledge, log every call, control access.
-
-What stays in the agent (client side):
-  - the LLM and the graph (same as v1);
-  - ask_user and the report approval: talking to the HUMAN is the client's job.
-
-Run it (from the repo root):
-    python -m v2_mcp.agent "A chatbot that answers questions about our products."
+Usage:
+    python -m v2_mcp.agent "<system description>"
 """
 
 import asyncio
@@ -35,14 +24,12 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-# Reused from v0/v1: prompt, model settings, state, routing, human-side functions.
 from v0_scratch.agent import LLM_OPTIONS, MODEL, SYSTEM_PROMPT, TOOL_SCHEMAS, wrap_description
-from v1_langgraph.agent import (RECURSION_LIMIT, State, _ask_user, _log_update, _short,
-                                answer_in_terminal, approve_in_terminal, nudge_node, route_after_agent)
+from v1_langgraph.agent import (RECURSION_LIMIT, State, _ask_user, _log_update, answer_in_terminal,
+                                approve_in_terminal, nudge_node, print_result, route_after_agent)
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# How to start the MCP server (stdio = subprocess talking over stdin/stdout).
 MCP_SERVERS = {
     "compliance": {
         "command": sys.executable,
@@ -50,14 +37,12 @@ MCP_SERVERS = {
         "transport": "stdio",
     }
 }
-# ask_user is a LOCAL tool (not on the server): we reuse its schema from v0.
+# ask_user is client-side; its schema is reused from v0.
 ASK_USER_SCHEMA = next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "ask_user")
 
 
 def build_graph(mcp_tools: list):
-    """Same graph as v1, but tool calls go to the MCP server."""
     tools_by_name = {tool.name: tool for tool in mcp_tools}
-    # The LLM sees the schemas DISCOVERED from the server + the local ask_user.
     llm = ChatOllama(model=MODEL, **LLM_OPTIONS).bind_tools(mcp_tools + [ASK_USER_SCHEMA])
 
     async def agent_node(state: State) -> dict:
@@ -65,17 +50,16 @@ def build_graph(mcp_tools: list):
         return {"messages": [response]}
 
     async def call_mcp(name: str, args: dict) -> dict:
-        """Call a tool on the MCP server and turn its answer back into a dict."""
+        """Call a server tool and decode its JSON text content into a dict."""
         if name not in tools_by_name:
             return {"error": f"Unknown tool '{name}'. Available tools: "
                              f"{', '.join(list(tools_by_name) + ['ask_user'])}"}
         output = await tools_by_name[name].ainvoke(args)
-        # MCP returns a list of content blocks; ours is one text block with JSON inside.
         text = output[0]["text"] if isinstance(output, list) else str(output)
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            return {"error": text}  # e.g. a validation error raised by the MCP server itself
+            return {"error": text}  # FastMCP's own argument validation returns plain text
 
     async def tools_node(state: State) -> dict:
         questions_asked = state["questions_asked"]
@@ -83,14 +67,13 @@ def build_graph(mcp_tools: list):
         tool_messages = []
         for call in state["messages"][-1].tool_calls:
             name, args = call["name"], call["args"]
-            if name == "ask_user":  # local: pause the graph, like in v1
+            if name == "ask_user":
                 result = _ask_user(args, questions_asked)
                 if "answer" in result:
                     questions_asked += 1
             elif name == "save_report":
-                # Approval FIRST (client side), then the server checks and writes.
-                # Unlike v1, the human may see a draft that the server will refuse:
-                # the guardrails live on the server, the agent does not import them.
+                # Approval precedes server-side validation here: the guardrails live on the
+                # server, so a reviewer may approve a draft the server then rejects.
                 decision = interrupt({"type": "approval", **args})
                 if decision["action"] == "approve":
                     result = await call_mcp(name, args)
@@ -119,7 +102,7 @@ def build_graph(mcp_tools: list):
 
 async def run_turn(graph, user_text: str, thread_id: str, first_turn: bool,
                    answer_fn=answer_in_terminal, approve_fn=approve_in_terminal, verbose: bool = True) -> dict:
-    """Same as v1.run_turn, but async (MCP calls are network-style I/O)."""
+    """Async counterpart of v1.run_turn."""
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
     content = wrap_description(user_text) if first_turn else user_text
     graph_input = {"messages": [HumanMessage(content)], "questions_asked": 0,
@@ -146,7 +129,7 @@ async def run_turn(graph, user_text: str, thread_id: str, first_turn: bool,
     except GraphRecursionError:
         trace["stopped_by"] = "max_steps"
         if verbose:
-            print(f"\n⛔ Stopped: recursion limit ({RECURSION_LIMIT} node runs) reached.")
+            print(f"\nstopped: recursion limit ({RECURSION_LIMIT} node runs) reached")
     state = (await graph.aget_state(config)).values
     trace["final_answer"] = state["messages"][-1].content
     trace["latency_s"] = round(time.time() - start, 1)
@@ -155,24 +138,20 @@ async def run_turn(graph, user_text: str, thread_id: str, first_turn: bool,
 
 async def main() -> None:
     client = MultiServerMCPClient(MCP_SERVERS)
-    # Keep ONE session open for the whole conversation (otherwise each tool
-    # call would start a new server process).
+    # One session for the whole run; without it each tool call spawns a new server process.
     async with client.session("compliance") as session:
         mcp_tools = await load_mcp_tools(session)
-        print(f"🔌 Connected to MCP server, tools discovered: {[t.name for t in mcp_tools]}")
+        print(f"MCP tools: {[t.name for t in mcp_tools]}")
         graph = build_graph(mcp_tools)
 
         thread_id = str(uuid.uuid4())
-        user_text = " ".join(sys.argv[1:]) or input("Describe the AI system to assess:\n> ")
+        user_text = " ".join(sys.argv[1:]) or input("System description:\n> ")
         first_turn = True
         while user_text.strip():
             trace = await run_turn(graph, user_text, thread_id, first_turn)
-            print(f"\n🏁 {_short(trace['final_answer'] or '(no final answer)', 500)}")
-            print(f"   steps={trace['steps']}  stopped_by={trace['stopped_by']}  latency={trace['latency_s']}s")
-            if trace["report"]:
-                print(f"   report saved to {trace['report']['path']}")
+            print_result(trace)
             first_turn = False
-            user_text = input("\n💬 Follow-up on the same thread (empty = quit): ")
+            user_text = input("\nFollow-up on this thread (empty to quit): ")
 
 
 if __name__ == "__main__":

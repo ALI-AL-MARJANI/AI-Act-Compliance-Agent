@@ -1,19 +1,12 @@
-"""Compliance tools used by every version of the agent (v0, v1, v2).
+"""Compliance tools shared by all agent versions (v0, v1, v2).
 
-A "tool" is just a plain Python function. The LLM never runs code: it only
-asks us to call one of these functions with some arguments, and we send the
-result back to it. Because the tools are plain functions, we can test them
-without any LLM (see tests/test_tools.py).
-
-Design rules for every tool:
-1. Arguments are validated with pydantic before doing anything.
-2. A tool NEVER raises an exception. On a problem it returns {"error": "..."}.
-   The agent sends this error back to the LLM as an observation, so the LLM
-   can fix its call and try again (self-correction).
-3. Tools return plain dicts (easy to turn into JSON for the LLM).
-4. Type hints use Literal for the allowed values: the MCP server (v2) turns
-   them into the JSON schema it publishes. Python itself does not enforce them,
-   so the pydantic validation inside each tool is still needed.
+Contract:
+- arguments are validated with pydantic;
+- tools never raise: failures are returned as {"error": ...} so the agent can
+  feed them back to the model as observations;
+- results are JSON-serialisable dicts;
+- Literal type hints are kept for FastMCP schema generation (v2); runtime
+  validation still relies on the pydantic models.
 """
 
 import json
@@ -24,9 +17,7 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-# ---------------------------------------------------------------------------
-# Knowledge base (loaded once, when the module is imported)
-# ---------------------------------------------------------------------------
+# --- Knowledge base -----------------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
 KNOWLEDGE_DIR = ROOT / "knowledge"
 REPORTS_DIR = ROOT / "reports"
@@ -42,14 +33,14 @@ DISCLAIMER = (
     "Disclaimer: this is an automated first-pass assessment produced by an "
     "educational prototype. It is not legal advice."
 )
-MAX_QUESTIONS = 3  # max ask_user calls per assessment
+MAX_QUESTIONS = 3  # per assessment
 
-# Citation format required in reports: [AI Act Art. 6(3)] or [GDPR Art. 22]
+# Required citation format: [AI Act Art. 6(3)], [GDPR Art. 22]
 CITATION_PATTERN = re.compile(r"\[(AI Act|GDPR) Art\. (\d+)[^\]]*\]")
-# Any loose mention like "Article 30" or "Art. 30", cited or not
+# Free-text references ("Article 30", "Art. 30"), checked as well
 ANY_ARTICLE_PATTERN = re.compile(r"\bArt(?:icle|\.)\s*(\d+)", re.IGNORECASE)
 
-# Which articles to list for each risk category (texts come from articles.json)
+# Articles returned by get_obligations, per category (texts from articles.json)
 OBLIGATIONS = {
     "prohibited": [("ai_act", "5"), ("ai_act", "99")],
     "high_risk": [
@@ -64,10 +55,7 @@ OBLIGATIONS = {
 REGULATION_NAMES = {"ai_act": "AI Act", "gdpr": "GDPR"}
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models: one per tool, they describe and validate the arguments.
-# (v0 also turns them into the JSON schemas sent to the LLM.)
-# ---------------------------------------------------------------------------
+# --- Argument models (also used to generate the tool schemas in v0/v1) -------
 class CheckProhibitedArgs(BaseModel):
     description: str = Field(min_length=10, max_length=4000,
                              description="Description of the AI system")
@@ -85,10 +73,10 @@ class GetArticleArgs(BaseModel):
     @field_validator("article")
     @classmethod
     def keep_number_only(cls, value: str) -> str:
-        # Refuse several articles at once ("5,6,9"): silently keeping one would mislead the LLM.
+        # Reject batched requests ("5,6,9") rather than silently keeping the first one.
         if re.search(r"\d+\s*(,|;|\band\b)\s*\d+", value):
             raise ValueError("ask for ONE article per call, e.g. '22'")
-        # Small models often send "Article 22" or "22(1)": keep only "22".
+        # Normalise "Article 22" / "22(1)" to "22".
         match = re.search(r"\d+", value)
         if not match:
             raise ValueError("article must contain a number, e.g. '22'")
@@ -119,13 +107,11 @@ def _validate(model: type[BaseModel], **kwargs):
         return None, {"error": f"Invalid arguments: {problems}"}
 
 
-# ---------------------------------------------------------------------------
-# Tool 1 — prohibited practices (Article 5)
-# ---------------------------------------------------------------------------
+# --- Tools ------------------------------------------------------------------------
 def check_prohibited_practices(description: str) -> dict:
     """Return the Article 5 prohibited practices and their criteria.
 
-    The tool gives the RULES; the LLM compares them with the description.
+    The tool supplies the rules; matching them against the description is left to the model.
     """
     args, error = _validate(CheckProhibitedArgs, description=description)
     if error:
@@ -139,9 +125,6 @@ def check_prohibited_practices(description: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Tool 2 — high-risk areas (Article 6 + Annex III)
-# ---------------------------------------------------------------------------
 def check_high_risk_areas(domain: str) -> dict:
     """Return the Annex III area(s) matching a domain keyword."""
     args, error = _validate(CheckHighRiskArgs, domain=domain)
@@ -152,7 +135,7 @@ def check_high_risk_areas(domain: str) -> dict:
     matches = []
     for area in ANNEX_III["areas"]:
         names = [area["domain"].replace("_", " ")] + area["keywords"]
-        # whole-word match, so "hr" does not match inside "three"
+        # whole-word match ("hr" must not match "three")
         if any(re.search(rf"\b{re.escape(name)}\b", query) for name in names):
             matches.append(area)
 
@@ -176,9 +159,6 @@ def check_high_risk_areas(domain: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Tool 3 — one article summary
-# ---------------------------------------------------------------------------
 def get_article(regulation: Literal["ai_act", "gdpr"], article: str) -> dict:
     """Return the summary of one article of the AI Act or the GDPR."""
     args, error = _validate(GetArticleArgs, regulation=regulation, article=article)
@@ -196,9 +176,6 @@ def get_article(regulation: Literal["ai_act", "gdpr"], article: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Tool 4 — obligations for a risk category
-# ---------------------------------------------------------------------------
 def get_obligations(risk_category: RiskCategory) -> dict:
     """Return the main obligations for a risk category, with article references."""
     args, error = _validate(GetObligationsArgs, risk_category=risk_category)
@@ -215,11 +192,7 @@ def get_obligations(risk_category: RiskCategory) -> dict:
     return {"risk_category": args.risk_category, "obligations": obligations}
 
 
-# ---------------------------------------------------------------------------
-# Tool 5 — ask the user a clarifying question
-# ---------------------------------------------------------------------------
-# Where answers come from. None = the terminal. The eval sets a function that
-# answers from the case file; v1 sets a function that pauses the graph.
+# Answer source for ask_user: None = stdin; the eval injects answers from the case file.
 _answer_provider: Callable[[str], str] | None = None
 _questions_asked = 0
 
@@ -230,7 +203,7 @@ def set_answer_provider(provider: Callable[[str], str] | None) -> None:
 
 
 def reset_assessment() -> None:
-    """Call at the start of each new assessment (resets the question counter)."""
+    """Reset per-assessment state (question counter)."""
     global _questions_asked
     _questions_asked = 0
 
@@ -247,27 +220,23 @@ def ask_user(question: str) -> dict:
                      "continue with the information you have and state your assumptions in the report."
         }
     if _answer_provider is None:
-        answer = input(f"\n🤖 Agent asks: {args.question}\n👤 Your answer: ")
+        answer = input(f"\n[question] {args.question}\n> ")
     else:
         answer = _answer_provider(args.question)
-    # count AFTER getting the answer (matters for v1, where the call is replayed on resume)
+    # Incremented after the answer: in v1 the node is replayed on resume.
     _questions_asked += 1
     return {"question": args.question, "answer": answer}
 
 
-# ---------------------------------------------------------------------------
-# Tool 6 — save the report (sensitive action)
-# ---------------------------------------------------------------------------
 def extract_citations(text: str) -> list[str]:
     """Return the citations found in a text, e.g. ['AI Act Art. 6', 'GDPR Art. 22']."""
     return sorted({f"{reg} Art. {num}" for reg, num in CITATION_PATTERN.findall(text)})
 
 
 def validate_report(title: str, risk_category: str, content_markdown: str) -> dict | None:
-    """Check a report before saving it. Return None if OK, else an error dict.
+    """Return None if the report passes all checks, else an error dict.
 
-    The agents call this BEFORE asking the human for approval, so the human
-    only reviews reports that already pass the automatic checks.
+    Called by the agents before requesting human approval.
     """
     args, error = _validate(SaveReportArgs, title=title, risk_category=risk_category,
                             content_markdown=content_markdown)
@@ -275,7 +244,7 @@ def validate_report(title: str, risk_category: str, content_markdown: str) -> di
         return error
     content = args.content_markdown
 
-    # The disclaimer must be at the TOP of the report (in the first lines), not hidden at the end.
+    # Disclaimer must appear at the top of the report.
     if "not legal advice" not in content[:400].lower():
         return {"error": f"The report must START with this exact disclaimer line: '{DISCLAIMER}'"}
 
@@ -284,13 +253,12 @@ def validate_report(title: str, risk_category: str, content_markdown: str) -> di
         return {"error": "The report must cite at least one article, using the format "
                          "[AI Act Art. 6] or [GDPR Art. 22]."}
 
-    # Guardrail against invented articles: every cited article must exist in the knowledge base.
+    # Every cited article must exist in the knowledge base.
     unknown = []
     for reg_name, number in citations:
         regulation = "ai_act" if reg_name == "AI Act" else "gdpr"
         if number not in ARTICLES[regulation]:
             unknown.append(f"{reg_name} Art. {number}")
-    # Also check loose mentions like "Article 30" written without the bracket format.
     known_numbers = set(ARTICLES["ai_act"]) | set(ARTICLES["gdpr"])
     unknown += [f"Art. {n}" for n in ANY_ARTICLE_PATTERN.findall(content) if n not in known_numbers]
     if unknown:
@@ -305,11 +273,11 @@ def save_report(title: str, risk_category: RiskCategory, content_markdown: str) 
     if error:
         return error
 
-    # Least privilege: build the filename ourselves, never use a path from the LLM.
+    # The filename is derived server-side; no path is ever taken from the model.
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "report"
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     path = (REPORTS_DIR / f"{timestamp}_{risk_category}_{slug}.md").resolve()
-    if path.parent != REPORTS_DIR.resolve():  # defence in depth: must stay in reports/
+    if path.parent != REPORTS_DIR.resolve():
         return {"error": "Refused: the report path is outside the reports/ folder."}
 
     REPORTS_DIR.mkdir(exist_ok=True)
@@ -317,7 +285,7 @@ def save_report(title: str, risk_category: RiskCategory, content_markdown: str) 
     return {"status": "saved", "path": str(path.relative_to(ROOT))}
 
 
-# Registry used by the agents: tool name -> (function, pydantic model of its arguments)
+# name -> (function, argument model)
 TOOLS = {
     "check_prohibited_practices": (check_prohibited_practices, CheckProhibitedArgs),
     "check_high_risk_areas": (check_high_risk_areas, CheckHighRiskArgs),

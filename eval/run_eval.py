@@ -1,25 +1,21 @@
-"""Benchmark the agents (v0 and v1) on the synthetic cases of eval/cases.json.
+"""Benchmark v0 and v1 on eval/cases.json.
 
-Automatic mode:
-  - ask_user is answered with the case's hidden_facts (all of them, joined),
-    or "No additional information" for complete cases;
-  - report approval is simulated (always approve).
+Non-interactive: ask_user is answered with the case's hidden_facts (joined), or
+"No additional information" for complete cases; report approval is auto-accepted.
 
-What we measure:
-  - risk classification (like a classifier): accuracy, macro-F1, confusion matrix.
-    The prediction is the risk_category of the SAVED report ("no_report" if none).
-  - article citations: precision / recall on the classification articles
-    (AI Act Art. 5, 6, 50) cited in the saved report vs the gold articles.
-  - GDPR flags: precision / recall. Flags are read from the GDPR citations:
-    Art. 5/6 -> personal_data, 9 -> special_categories, 22 -> automated_decision, 35 -> dpia.
-  - clarification: on incomplete cases, did it call ask_user BEFORE the first
-    save_report? On complete cases, did it avoid asking?
-  - hallucinated citations: unknown articles in saved reports (should be 0),
-    and how many invented articles the guardrails caught during the runs.
-  - average steps, tool error rate, self-corrections, nudges, latency.
+Metrics:
+- classification: accuracy, macro-F1, confusion matrix; prediction = risk_category
+  of the saved report ("no_report" if none);
+- citations: micro precision / recall on classification articles (AI Act Art. 5, 6, 50);
+- GDPR flags: micro precision / recall, derived from GDPR citations
+  (Art. 5/6 -> personal_data, 9 -> special_categories, 22 -> automated_decision, 35 -> dpia);
+- clarification: ask_user before the first save_report on incomplete cases,
+  no question on complete cases;
+- hallucinated citations in saved reports, and invented articles caught by the guardrails;
+- steps, tool error rate, self-corrections, nudges, latency.
 
-Run (from the repo root):
-    python -m eval.run_eval                       # v0 and v1, all cases (long!)
+Usage:
+    python -m eval.run_eval
     python -m eval.run_eval --versions v0 --limit 3
 """
 

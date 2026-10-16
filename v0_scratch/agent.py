@@ -1,24 +1,12 @@
-"""v0 — an AI agent written FROM SCRATCH, in plain Python.
+"""v0 — tool-calling agent loop implemented directly on the Ollama chat API.
 
-What is an agent?
-    An LLM alone can only produce text. An agent is an LLM inside a LOOP that
-    can call TOOLS (Python functions) and see their results:
+Loop: call the model with the conversation and tool schemas; execute any tool
+calls and append the results as `tool` messages; stop on a response without
+tool calls or after MAX_STEPS. A bounded nudge handles premature stops (the
+model answering before the report is saved).
 
-        while not done:
-            1. send the conversation + the list of available tools to the LLM
-            2. the LLM answers either:
-               a) "please call tool X with arguments Y"   -> we run X(Y), append
-                  the result to the conversation, and loop again
-               b) a normal text answer                    -> it is done, stop
-    This is the ReAct pattern: Reason -> Act (call a tool) -> Observe (read
-    the result) -> Reason again...
-
-    The LLM decides WHICH tool to call and WHEN. Our Python code only
-    executes the calls, checks them, and decides when to stop.
-
-Run it (from the repo root):
-    python -m v0_scratch.agent "A chatbot that answers questions about our products."
-    python -m v0_scratch.agent          # then type the description
+Usage:
+    python -m v0_scratch.agent "<system description>"
 """
 
 import json
@@ -30,16 +18,13 @@ import ollama
 from tools import compliance_tools as ct
 
 MODEL = "qwen2.5:7b"
-MAX_STEPS = 15  # safety net: stop even if the LLM keeps calling tools forever
-MAX_NUDGES = 2  # how many times we remind the LLM to finish if it stops too early
+MAX_STEPS = 15
+MAX_NUDGES = 2
 LLM_OPTIONS = {
-    "temperature": 0,   # as deterministic as possible (easier to debug and evaluate)
-    "num_ctx": 16384,   # context window; Ollama's default is too small for our tool results
+    "temperature": 0,
+    "num_ctx": 16384,  # Ollama's default context is too small for the tool outputs
 }
 
-# ---------------------------------------------------------------------------
-# 1. The system prompt: the "job description" of the agent.
-# ---------------------------------------------------------------------------
 SYSTEM_PROMPT = f"""You are a junior EU AI Act and GDPR compliance consultant.
 You perform a FIRST-PASS risk assessment of an AI system, using your tools.
 
@@ -94,13 +79,8 @@ After the report is saved, reply with ONE short sentence giving the risk categor
 """
 
 
-# ---------------------------------------------------------------------------
-# 2. Tool schemas: how the LLM knows which tools exist.
-#    For each tool we send its name, a description (the docstring) and a JSON
-#    schema of its arguments. We generate the schema from the pydantic model,
-#    so the validation rules and the schema the LLM sees are always the same.
-# ---------------------------------------------------------------------------
 def build_tool_schemas() -> list[dict]:
+    """OpenAI-style function schemas generated from the pydantic argument models."""
     schemas = []
     for name, (function, args_model) in ct.TOOLS.items():
         schemas.append({
@@ -117,30 +97,23 @@ def build_tool_schemas() -> list[dict]:
 TOOL_SCHEMAS = build_tool_schemas()
 
 
-# ---------------------------------------------------------------------------
-# 3. Human-in-the-loop, naive version: a simple input() before saving.
-# ---------------------------------------------------------------------------
 def approve_in_terminal(arguments: dict) -> tuple[bool, str]:
-    """Show the draft report and ask the human. Returns (approved, feedback)."""
+    """Blocking approval prompt. Returns (approved, feedback)."""
     print("\n" + "=" * 70)
-    print(f"📄 DRAFT REPORT — {arguments['title']} [{arguments['risk_category']}]")
+    print(f"DRAFT REPORT — {arguments['title']} [{arguments['risk_category']}]")
     print("=" * 70)
     print(arguments["content_markdown"])
     print("=" * 70)
     answer = ""
-    while answer not in ("y", "n"):  # ask again on a typo or an empty line
+    while answer not in ("y", "n"):
         answer = input("Approve and save this report? (y/n): ").strip().lower()
     if answer == "y":
         return True, ""
-    return False, input("Why? (feedback for the agent): ")
+    return False, input("Feedback for the agent: ")
 
 
-# ---------------------------------------------------------------------------
-# 4. Tool execution: the ONLY place where the LLM's wishes become real actions.
-#    Every problem is turned into an {"error": ...} observation: the loop never
-#    crashes, and the LLM gets a chance to correct itself.
-# ---------------------------------------------------------------------------
 def execute_tool(name: str, arguments, approve_fn) -> dict:
+    """Execute one tool call. Every failure is returned as an observation."""
     if name not in ct.TOOLS:
         return {"error": f"Unknown tool '{name}'. Available tools: {', '.join(ct.TOOLS)}"}
     if not isinstance(arguments, dict):
@@ -148,7 +121,7 @@ def execute_tool(name: str, arguments, approve_fn) -> dict:
     function, _ = ct.TOOLS[name]
 
     if name == "save_report":
-        # Sensitive action: automatic checks first, THEN the human decides.
+        # Automated checks first, then human approval.
         try:
             error = ct.validate_report(**arguments)
         except TypeError as e:
@@ -161,22 +134,18 @@ def execute_tool(name: str, arguments, approve_fn) -> dict:
 
     try:
         return function(**arguments)
-    except TypeError as e:  # missing or unexpected argument names
+    except TypeError as e:  # missing / unexpected argument names
         return {"error": f"Invalid arguments for {name}: {e}"}
 
 
 def wrap_description(description: str) -> str:
-    """Input treated as DATA: wrap it in tags, and remove any tag the user may
-    have written to "escape" from the data block (prompt injection)."""
+    """Delimit user input as data; strip delimiter tags to prevent breaking out of the block."""
     clean = description.replace("<system_description>", "").replace("</system_description>", "")
     return f"Assess this AI system.\n<system_description>\n{clean}\n</system_description>"
 
 
-# ---------------------------------------------------------------------------
-# 5. The agent loop.
-# ---------------------------------------------------------------------------
 def run_agent(description: str, approve_fn=approve_in_terminal, verbose: bool = True) -> dict:
-    """Assess one AI system. Returns a trace that the evaluation script can analyse."""
+    """Run one assessment and return its trace (consumed by eval/run_eval.py)."""
     ct.reset_assessment()
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -189,45 +158,40 @@ def run_agent(description: str, approve_fn=approve_in_terminal, verbose: bool = 
 
     for step in range(1, MAX_STEPS + 1):
         trace["steps"] = step
-        # Ask the LLM what to do next, giving it the whole conversation + the tool schemas.
         response = ollama.chat(model=MODEL, messages=messages, tools=TOOL_SCHEMAS, options=LLM_OPTIONS)
         message = response.message
-        messages.append(message)  # the LLM's turn becomes part of the conversation
+        messages.append(message)
 
         if verbose:
-            print(f"\n──────── Step {step} ────────")
+            print(f"\n[step {step}]")
             if message.content:
-                print(f"🧠 Thought: {message.content.strip()}")
+                print(f"thought      {message.content.strip()}")
 
-        # No tool call = the LLM thinks it is done. Small models sometimes stop
-        # BEFORE saving the report: we then remind them (a "nudge"), at most twice.
+        # Premature stop: the model answered without having saved a report.
         if not message.tool_calls and trace["report"] is None and trace["nudges"] < MAX_NUDGES:
             trace["nudges"] += 1
             if verbose:
-                print("💬 Nudge: the report is not saved yet, reminding the agent.")
+                print("nudge        report not saved yet, reminder sent")
             messages.append({"role": "user", "content": "You have not saved the report yet. "
                              "Finish the procedure and call save_report."})
             continue
 
-        # STOP CONDITION 1: no tool call -> this is the final answer.
+        # Normal termination: no tool call.
         if not message.tool_calls:
             trace["final_answer"] = message.content
             trace["stopped_by"] = "final_answer"
-            if verbose:
-                print("✅ Final answer (no more tool calls).")
             break
 
-        # Otherwise run each requested tool and append its result as a "tool" message.
         for call in message.tool_calls:
             name, arguments = call.function.name, call.function.arguments
             if verbose:
-                print(f"🔧 Action: {name}({_short(json.dumps(arguments, ensure_ascii=False), 200)})")
+                print(f"action       {name}({_short(json.dumps(arguments, ensure_ascii=False), 200)})")
 
             result = execute_tool(name, arguments, approve_fn)
 
             if verbose:
-                icon = "❌" if "error" in result else "👀"
-                print(f"{icon} Observation: {_short(json.dumps(result, ensure_ascii=False), 300)}")
+                label = "error      " if "error" in result else "observation"
+                print(f"{label}  {_short(json.dumps(result, ensure_ascii=False), 300)}")
             trace["tool_calls"].append({"name": name, "arguments": arguments, "result": result})
             if name == "save_report" and result.get("status") == "saved":
                 trace["report"] = {**arguments, "path": result["path"]}
@@ -235,10 +199,10 @@ def run_agent(description: str, approve_fn=approve_in_terminal, verbose: bool = 
             messages.append({"role": "tool", "tool_name": name,
                              "content": json.dumps(result, ensure_ascii=False)})
     else:
-        # STOP CONDITION 2: the for-loop ended without "break" -> MAX_STEPS reached.
+        # Step budget exhausted.
         trace["stopped_by"] = "max_steps"
         if verbose:
-            print(f"\n⛔ Stopped: MAX_STEPS ({MAX_STEPS}) reached.")
+            print(f"\nstopped: MAX_STEPS ({MAX_STEPS}) reached")
 
     trace["latency_s"] = round(time.time() - start, 1)
     return trace
@@ -251,7 +215,7 @@ def _short(text: str, limit: int) -> str:
 if __name__ == "__main__":
     description = " ".join(sys.argv[1:]) or input("Describe the AI system to assess:\n> ")
     trace = run_agent(description)
-    print(f"\n🏁 {trace['final_answer'] or '(no final answer)'}")
-    print(f"   steps={trace['steps']}  stopped_by={trace['stopped_by']}  latency={trace['latency_s']}s")
+    print(f"\nresult       {trace['final_answer'] or '(no final answer)'}")
+    print(f"             steps={trace['steps']} stopped_by={trace['stopped_by']} latency={trace['latency_s']}s")
     if trace["report"]:
-        print(f"   report saved to {trace['report']['path']}")
+        print(f"             report: {trace['report']['path']}")

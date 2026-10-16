@@ -1,7 +1,4 @@
-"""Tests of the compliance tools, WITHOUT any LLM.
-
-Run from the repo root:  python -m pytest -v
-"""
+"""Unit tests for tools/compliance_tools.py (no LLM required)."""
 
 import pytest
 
