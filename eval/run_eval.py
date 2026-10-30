@@ -1,4 +1,4 @@
-"""Benchmark v0 and v1 on eval/cases.json.
+"""Benchmark the agent versions on eval/cases.json.
 
 Non-interactive: ask_user is answered with the case's hidden_facts (joined), or
 "No additional information" for complete cases; report approval is auto-accepted.
@@ -12,11 +12,13 @@ Metrics:
 - clarification: ask_user before the first save_report on incomplete cases,
   no question on complete cases;
 - hallucinated citations in saved reports, and invented articles caught by the guardrails;
-- steps, tool error rate, self-corrections, nudges, latency.
+- steps, tool error rate, self-corrections, nudges, latency;
+- v3 only: LLM calls (supervisor included) and handoffs.
 
 Usage:
     python -m eval.run_eval
     python -m eval.run_eval --versions v0 --limit 3
+    python -m eval.run_eval --versions v1 v3_fixed v3_llm
 """
 
 import argparse
@@ -31,6 +33,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 from tools import compliance_tools as ct
 from v0_scratch import agent as v0
 from v1_langgraph import agent as v1
+from v3_multiagent import agent as v3
 
 EVAL_DIR = Path(__file__).resolve().parent
 LABELS = ct.RISK_CATEGORIES
@@ -38,6 +41,8 @@ CLASSIFICATION_ARTICLES = {"AI Act Art. 5", "AI Act Art. 6", "AI Act Art. 50"}
 GDPR_FLAG_OF_ARTICLE = {"GDPR Art. 5": "personal_data", "GDPR Art. 6": "personal_data",
                         "GDPR Art. 9": "special_categories", "GDPR Art. 22": "automated_decision",
                         "GDPR Art. 35": "dpia"}
+V3_ROUTING = {"v3_llm": "llm", "v3_fixed": "fixed"}
+VERSIONS = ["v0", "v1", *V3_ROUTING]
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +60,9 @@ def run_case(case: dict, version: str) -> dict:
         ct.set_answer_provider(answer)
         trace = v0.run_agent(case["description"], approve_fn=lambda args: (True, ""), verbose=False)
         ct.set_answer_provider(None)
+    elif version in V3_ROUTING:
+        trace = v3.run_turn(case["description"], routing=V3_ROUTING[version], answer_fn=answer,
+                            approve_fn=lambda draft: {"action": "approve"}, verbose=False)
     else:
         trace = v1.run_turn(case["description"], thread_id=str(uuid.uuid4()), first_turn=True,
                             answer_fn=answer, approve_fn=lambda draft: {"action": "approve"}, verbose=False)
@@ -97,6 +105,7 @@ def score_trace(case: dict, trace: dict) -> dict:
         "steps": trace["steps"], "tool_calls": len(calls), "tool_errors": len(errors),
         "self_corrections": self_corrections, "nudges": trace["nudges"],
         "stopped_by": trace["stopped_by"], "latency_s": trace["latency_s"],
+        "llm_calls": trace.get("llm_calls"), "handoffs": trace.get("handoffs"),
     }
 
 
@@ -109,6 +118,12 @@ def precision_recall(rows: list[dict], gold_key: str, pred_key: str) -> tuple[fl
     n_pred = sum(len(r[pred_key]) for r in rows)
     n_gold = sum(len(r[gold_key]) for r in rows)
     return (tp / n_pred if n_pred else 0.0), (tp / n_gold if n_gold else 0.0)
+
+
+def average(rows: list[dict], key: str) -> float | None:
+    """Mean of a metric, None if the version does not report it."""
+    values = [r[key] for r in rows if r[key] is not None]
+    return sum(values) / len(values) if values else None
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -138,6 +153,8 @@ def summarize(rows: list[dict]) -> dict:
         "nudges": sum(r["nudges"] for r in rows),
         "max_steps_reached": sum(r["stopped_by"] == "max_steps" for r in rows),
         "avg_latency_s": sum(r["latency_s"] for r in rows) / len(rows),
+        "avg_llm_calls": average(rows, "llm_calls"),
+        "avg_handoffs": average(rows, "handoffs"),
     }
 
 
@@ -148,7 +165,7 @@ def to_markdown(summaries: dict) -> str:
         if key == "confusion_matrix":
             continue
         values = [summaries[v][key] for v in versions]
-        values = [f"{x:.2f}" if isinstance(x, float) else str(x) for x in values]
+        values = ["-" if x is None else f"{x:.2f}" if isinstance(x, float) else str(x) for x in values]
         lines.append(f"| {key} | " + " | ".join(values) + " |")
     for v in versions:
         cm = summaries[v]["confusion_matrix"]
@@ -164,7 +181,7 @@ def to_markdown(summaries: dict) -> str:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--versions", nargs="+", default=["v0", "v1"], choices=["v0", "v1"])
+    parser.add_argument("--versions", nargs="+", default=["v0", "v1"], choices=VERSIONS)
     parser.add_argument("--limit", type=int, default=None, help="only the first N cases")
     parser.add_argument("--out", default=str(EVAL_DIR / "results.json"))
     args = parser.parse_args()
