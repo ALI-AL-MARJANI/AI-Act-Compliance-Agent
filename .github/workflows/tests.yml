@@ -12,6 +12,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # The tool tests need no LLM, so we only install what they import.
-      - run: pip install pydantic==2.14.1 pytest==9.1.1
+      # The tests need no LLM. The Ollama clients are only there because v3 imports v0 and v1.
+      - run: >
+          pip install pydantic==2.14.1 pytest==9.1.1 langgraph==1.2.15 langchain-core==1.6.11
+          ollama==0.6.3 langchain-ollama==1.1.0
       - run: pytest -v
