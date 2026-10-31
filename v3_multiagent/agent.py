@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import json
+import re
 import time
 import uuid
 from typing import Annotated, Callable, Literal, TypedDict
@@ -311,18 +312,47 @@ def save_with_guards(args: dict, classification: dict, report: dict | None) -> d
     return _save_report_with_approval(args)
 
 
+def repair_writer_response(response: AIMessage, state: State) -> AIMessage:
+    """Turn a report written as plain text into a save_report call and fill in known arguments.
+
+    Nothing is invented and no check is skipped: the call goes through the same guards.
+    A category that differs from the classification is left as is, so it is still rejected.
+    """
+    calls = response.tool_calls
+    start = response.content.find("Disclaimer:")
+    if not calls and start >= 0:
+        calls = [{"name": "save_report", "args": {"content_markdown": response.content[start:].strip()},
+                  "id": str(uuid.uuid4()), "type": "tool_call"}]
+    repaired = []
+    for call in calls:
+        if call["name"] == "save_report":
+            heading = re.search(r"^#\s+(.+)$", str(call["args"].get("content_markdown", "")), re.MULTILINE)
+            defaults = {"title": heading.group(1)[:120] if heading else "First-pass assessment",
+                        "risk_category": state["classification"]["risk_category"]}
+            call = {**call, "args": {**defaults, **call["args"]}}
+        repaired.append(call)
+    return response.model_copy(update={"tool_calls": repaired})
+
+
 def make_worker(builder: StateGraph, model, name: str, prompt: str, tools: dict,
-                task: Callable[[State], str], exit_tool: str) -> None:
+                task: Callable[[State], str], exit_tool: str, repair: Callable | None = None) -> None:
     """Add the <name>_agent / <name>_tools pair to the graph."""
     history_key = f"{name}_messages"
     output_key = OUTPUT_KEYS[name]
     agent, tools_name = f"{name}_agent", f"{name}_tools"
-    llm = model.bind_tools([tool_schema(n, function, args) for n, (function, args) in tools.items()])
+    schemas = {n: tool_schema(n, function, args) for n, (function, args) in tools.items()}
+    # qwen2.5:7b writes its tool calls as plain text when an exit tool is on offer from the
+    # first step. Analysts therefore get it only once they stop calling their analysis tools.
+    analysis_llm = model.bind_tools([s for n, s in schemas.items() if n != exit_tool or name == "writer"])
+    exit_llm = model.bind_tools([schemas[exit_tool]])
 
     def agent_node(state: State) -> dict:
         # A handoff always starts with a briefing, so a retried sub-agent sees fresh findings.
         new_messages = [HumanMessage(task(state))] if state["worker_steps"] == 0 else []
+        llm = exit_llm if state["worker_nudges"] else analysis_llm
         response = llm.invoke([SystemMessage(prompt)] + state[history_key] + new_messages)
+        if repair:
+            response = repair(response, state)
         new_messages.append(response)
         steps, nudges = state["worker_steps"] + 1, state["worker_nudges"]
         if not response.tool_calls and nudges < MAX_NUDGES and steps < MAX_WORKER_STEPS:
@@ -461,7 +491,8 @@ def build_graph(model=None, routing: str = "llm"):
     builder.add_node("supervisor", make_supervisor(model, routing))
     make_worker(builder, model, "ai_act", AI_ACT_PROMPT, AI_ACT_TOOLS, analyst_task, "submit_classification")
     make_worker(builder, model, "gdpr", GDPR_PROMPT, GDPR_TOOLS, analyst_task, "submit_gdpr_findings")
-    make_worker(builder, model, "writer", WRITER_PROMPT, WRITER_TOOLS, writer_task, "save_report")
+    make_worker(builder, model, "writer", WRITER_PROMPT, WRITER_TOOLS, writer_task, "save_report",
+                repair_writer_response)
     builder.add_edge(START, "supervisor")
     builder.add_conditional_edges("supervisor", route_from_supervisor,
                                   ["ai_act_agent", "gdpr_agent", "writer_agent", END])

@@ -263,6 +263,33 @@ def test_edited_report_is_read_back_from_disk():
     assert trace["report"]["content_markdown"] == edited
 
 
+def test_report_written_as_text_is_saved_after_the_same_checks():
+    trace, _ = run([calls(CLASSIFY), calls(FINDINGS), text("Here it is.\n" + REPORT)])
+    assert trace["report"]["risk_category"] == "high_risk"
+    assert trace["report"]["title"] == "First-pass assessment: CV ranking tool"
+    assert trace["report"]["content_markdown"].startswith(ct.DISCLAIMER)
+    assert trace["nudges"] == 0
+
+
+def test_invalid_report_written_as_text_is_still_rejected():
+    invalid = ct.DISCLAIMER + "\n\nThis system is high risk because of what it does to people."
+    trace, _ = run([calls(CLASSIFY), calls(FINDINGS), text(invalid), calls(SAVE)])
+    assert "cite at least one article" in errors_of(trace, "save_report")[0]
+
+
+def test_missing_save_arguments_come_from_the_classification():
+    partial = ("save_report", {"content_markdown": REPORT})
+    trace, _ = run([calls(CLASSIFY), calls(FINDINGS), calls(partial)])
+    assert trace["report"]["risk_category"] == "high_risk"
+
+
+def test_exit_tool_is_only_offered_after_the_analysis():
+    _, model = run([text(), calls(CLASSIFY), calls(FINDINGS), calls(SAVE)])
+    assert "submit_classification" not in model.seen[0][0]
+    assert model.seen[1][0] == ["submit_classification"]
+    assert "save_report" in model.seen[3][0]
+
+
 def test_two_saves_in_one_message_write_one_file():
     trace, _ = run([calls(CLASSIFY), calls(FINDINGS), calls(SAVE, SAVE)])
     assert len(saved_reports()) == 1
