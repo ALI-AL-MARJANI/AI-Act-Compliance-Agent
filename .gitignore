@@ -6,7 +6,6 @@ __pycache__/
 # Virtual environment
 .venv/
 
-# Generated compliance reports (never commit them)
 reports/
 
 # OS / editor
@@ -14,6 +13,5 @@ reports/
 .vscode/
 .idea/
 
-# Local notes and recordings (not part of the published repo)
 LEARNING.md
 docs/
