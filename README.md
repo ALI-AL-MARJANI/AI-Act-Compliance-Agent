@@ -47,6 +47,7 @@ Guards in code: no writer before a classification, no finish before a saved repo
 | Asked on underspecified cases | 0/6 | 5/6 | 5/6 |
 | No question on complete cases | 20/20 | 15/20 | 12/20 |
 | Unknown articles in saved reports | 0 | 0 | 0 |
+| Tool error rate | 6.0% | 14.5% | 14.6% |
 | Mean agent steps | 6.5 | 10.9 | 14.2 |
 | Mean LLM calls | - | 10.9 | 17.8 |
 | Mean handoffs | - | 2.6 | 3.6 |
@@ -73,6 +74,21 @@ The supervisor is not a reliable planner. In those two cases, it tried `gdpr` ag
 - v1 and v3 ran in separate sessions, and `v3_llm` was split in two (18 then 8 cases). v1 latency moved from 175 s to 112 s between two runs, so treat latency as rough and prefer step counts.
 - A 7B local model struggles on borderline cases and is sensitive to prompt wording.
 - v3 is single-turn: no follow-up on a thread, unlike v1.
+- v3 has two fixes that v1 lacks: analysts get the exit tool only after their analysis, and a report written as plain text is turned into a `save_report` call. The gap is therefore not only due to the multi-agent design.
+
+## Quickstart
+
+Requires Python 3.12 and [Ollama](https://ollama.com).
+
+```bash
+pip install -r requirements.txt
+ollama pull qwen2.5:7b
+
+pytest
+python -m v1_langgraph.agent "An AI chatbot on our website that answers product questions."
+python -m v3_multiagent.agent "An AI chatbot on our website that answers product questions." --routing llm
+python -m eval.run_eval --versions v1 v3_fixed v3_llm --out eval/my_run.json   # about 4 h on a laptop
+```
 
 ## Roadmap
 
