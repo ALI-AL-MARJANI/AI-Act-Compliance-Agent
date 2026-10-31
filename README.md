@@ -1,6 +1,6 @@
 <div align="center">
 
-# ai-act-compliance-agent
+# AI Act Compliance Agent
 
 **Describe an AI system in plain language and get a first-pass EU AI Act and GDPR risk report.<br>The same agent is built four ways, and the single-agent and multi-agent versions are benchmarked on the same cases.**
 
