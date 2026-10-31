@@ -25,7 +25,13 @@
 | [`v2_mcp`](v2_mcp/) | FastMCP | Same graph, tools served over MCP |
 | [`v3_multiagent`](v3_multiagent/agent.py) | LangGraph | A supervisor plus AI Act, GDPR and writer sub-agents, each with its own history |
 
+<p align="center">
+  <img src="assets/v3_architecture.png" alt="v3 architecture: a supervisor routes between AI Act, GDPR and writer sub-agents, with human answers and report approval" width="100%">
+</p>
+
 v3 has two routing modes. `fixed` always runs `ai_act -> gdpr -> writer`. `llm` lets the supervisor choose who works next.
+
+Guards in code: no writer before a classification, no finish before a saved report unless the AI Act agent has given up, the saved category must match the classification, and budgets on handoffs, steps, nudges and questions.
 
 ## Results
 
@@ -53,30 +59,6 @@ A case with no report counts as wrong. v0 and v1 give the same prediction on all
 **LLM routing mattered only as a retry.** `v3_fixed` and `v3_llm` agree on 24 of 26 cases. `v3_fixed` lost 5 reports because the AI Act agent stopped without calling a single tool, and the pipeline has no second attempt. The LLM supervisor sent that agent back to work. This recovered 2 of the 5 cases (H7, L2). The other 3 ran out of the 6 allowed handoffs.
 
 The supervisor is not a reliable planner. In those two cases, it tried `gdpr` again after delivery on H7 and asked to finish without a report on L2. The guards in code refused both. A fixed pipeline with one retry might give the same gain at a lower cost, but that is not tested.
-## v3 graph
-
-```mermaid
-graph TD
-    start([start]) --> supervisor
-    supervisor -.-> ai_act_agent
-    supervisor -.-> gdpr_agent
-    supervisor -.-> writer_agent
-    supervisor -.-> finish([end])
-    ai_act_agent -.-> ai_act_tools
-    ai_act_tools -.-> ai_act_agent
-    ai_act_agent -.-> supervisor
-    ai_act_tools -.-> supervisor
-    gdpr_agent -.-> gdpr_tools
-    gdpr_tools -.-> gdpr_agent
-    gdpr_agent -.-> supervisor
-    gdpr_tools -.-> supervisor
-    writer_agent -.-> writer_tools
-    writer_tools -.-> writer_agent
-    writer_agent -.-> supervisor
-    writer_tools -.-> supervisor
-```
-
-Guards in code: no writer before a classification, no finish before a saved report unless the AI Act agent has given up, the saved category must match the classification, and budgets on handoffs, steps, nudges and questions.
 
 ## What didn't work
 
